@@ -23,13 +23,13 @@
 
 int current_state;
 
-typedef struct msg_queue {
+struct msg_queue {
     struct msg message;
     struct msg_queue *next;
-} msg_queue;
+};
 
-msg_queue *queue_head;
-msg_queue *queue_tail;
+struct msg_queue *queue_head;
+struct msg_queue *queue_tail;
 
 struct pkt *current_packet;
 
@@ -56,8 +56,10 @@ int compute_checksum(char *data, int acknum, int seqnum) {
 }
 
 void addToQ(struct msg message) {
-    struct msg_queue *queue = malloc(sizeof(msg_queue));
+    struct msg_queue *queue = malloc(sizeof(struct msg_queue));
     memcpy(&queue->message, &message, sizeof(struct msg));
+    queue->next = NULL;
+
     if(queue_head == NULL){
         //first item
         queue_head = queue;
@@ -114,7 +116,6 @@ void A_output(struct msg message) {
     } else {
         sendBSide(&message);
     }
-
 }
 
 /*
@@ -139,7 +140,12 @@ void A_input(struct pkt packet) {
     stopTimer(AEntity);
 //handle the ack
 //if corrupt or not 1 in acknum field, resend
-    if (packet.acknum == 1 && compute_checksum(packet.payload, packet.acknum, packet.seqnum) == packet.checksum) {
+//1 means bad
+    if (packet.acknum == 1 || compute_checksum(packet.payload, packet.acknum, packet.seqnum) != packet.checksum) {
+        tolayer3(AEntity, *current_packet);
+        startTimer(AEntity, 100);
+    } else if (packet.acknum == 0){
+
         //we know that it sent correctly, so send the next packet.
         free(current_packet);
         current_state = SENDING;
@@ -190,16 +196,15 @@ void B_input(struct pkt packet) {
     // else send ack packet with 1
 
     struct pkt send_packet;
-    char* empty_buffer = malloc(sizeof(char) * MESSAGE_LENGTH);
-    bzero(empty_buffer, MESSAGE_LENGTH);//make it empty, response doesnt need a payload
+    char *empty_buffer = malloc(sizeof(char) * MESSAGE_LENGTH);
+    memset(empty_buffer, 0, MESSAGE_LENGTH);
 
-    send_packet.acknum = 1;
+    send_packet.acknum = compute_checksum(packet.payload,packet.acknum,packet.seqnum) != packet.checksum;
     send_packet.seqnum = run_seq;
-    strcpy(send_packet.payload, empty_buffer);
-    send_packet.checksum = compute_checksum(empty_buffer, 1, run_seq);
+    memcpy(send_packet.payload, empty_buffer, MESSAGE_LENGTH);
+    send_packet.checksum = compute_checksum(empty_buffer, compute_checksum(packet.payload,packet.acknum,packet.seqnum) != packet.checksum, run_seq);
 
     tolayer3(BEntity, send_packet);
-    free(empty_buffer);//done using
 
     //check to layer 5. the above runs no matter what, but layer 5 should only receive correct data
     if(packet.seqnum != run_seq || compute_checksum(packet.payload, packet.acknum, packet.seqnum) != packet.checksum){
