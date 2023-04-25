@@ -3,6 +3,9 @@
 #include <string.h>
 #include "project2.h"
 
+#define WAITING 0
+#define SENDING 1
+
 /* ***************************************************************************
  ALTERNATING BIT AND GO-BACK-N NETWORK EMULATOR: VERSION 1.1  J.F.Kurose
 
@@ -18,21 +21,19 @@
    Compile as gcc -g project2.c student2.c -o p2
 **********************************************************************/
 
-int base = 0; //this is the last known acked seq number
-int run_seqnum = 0; //this is the last sent packet's seq.
-int cur_ack = 0; //just used for acking packets
+int current_state;
 
-typedef struct packet_node{
-    struct pkt *packet;
-    struct packet_node *next_node;
-} packet_node;
+typedef struct msg_queue {
+    struct msg message;
+    struct msg_queue *next;
+} msg_queue;
 
-typedef struct {
-    packet_node *head;
-    packet_node *tail;
-} queue;
+msg_queue *queue_head;
+msg_queue *queue_tail;
 
-queue waiting_queue;
+struct pkt *current_packet;
+
+int run_seq = 0;
 
 /********* STUDENTS WRITE THE NEXT SEVEN ROUTINES *********/
 /* 
@@ -54,27 +55,50 @@ int compute_checksum(char *data, int acknum, int seqnum) {
     return checksum;
 }
 
-void addToQ(struct pkt *packet) {
-    packet_node *new_packet = NULL;
-    new_packet->packet = packet;
-    new_packet->next_node = NULL;
-
-    if (waiting_queue.head == NULL) {
-        waiting_queue.head = new_packet;
-        waiting_queue.tail = new_packet;
+void addToQ(struct msg message) {
+    struct msg_queue *queue = malloc(sizeof(msg_queue));
+    memcpy(&queue->message, &message, sizeof(struct msg));
+    if(queue_head == NULL){
+        //first item
+        queue_head = queue;
+        queue_tail = queue;
     } else {
-        waiting_queue.tail->next_node = new_packet;
+        //next is done first so that the current last node is linked to this, new last node
+        queue_tail->next = queue;
+        //no longer the last node, the new one is
+        queue_tail = queue;
     }
 }
 
-struct pkt getNextPacket(){
-    for(packet_node *node = waiting_queue.head; node != NULL; node = node->next_node){
-        if (node->packet->seqnum == base){
-            return *(node->packet);
-        }
+struct msg *popQueue(){
+    if(queue_head == NULL){
+        return NULL;
     }
-    //TODO this might be a problem
-    return *waiting_queue.head->packet;
+
+    struct msg *message = malloc(sizeof(struct msg));
+    memcpy(message, &queue_head->message, sizeof(struct msg));
+
+    //move over queue
+    struct msg_queue *prev_head = queue_head;
+    queue_head = queue_head->next;//the next one
+    free(prev_head);
+
+    return message;
+}
+
+void sendBSide(struct msg *message) {
+    //global packet so that every function knows what is currently being processed.
+    current_packet = malloc(sizeof(struct pkt));
+    int checksum = compute_checksum(message->data, 0, run_seq);
+    current_packet->acknum = 0;
+    current_packet->seqnum = run_seq;
+    current_packet->checksum = checksum;
+    strcpy(current_packet->payload, message->data);
+
+    tolayer3(AEntity, *current_packet);
+    startTimer(AEntity, 100);
+
+    current_state = WAITING;
 }
 
 /* 
@@ -85,19 +109,12 @@ struct pkt getNextPacket(){
  * in-order, and correctly, to the receiving side upper layer.
  */
 void A_output(struct msg message) {
-    //seq num is the 0,n number where n is bytes and acknum is 0 or 1
-    struct pkt *send_packet = malloc(sizeof(struct pkt));
-    send_packet->acknum = 0;
-    send_packet->seqnum = run_seqnum;
-    send_packet->checksum = compute_checksum(message.data, cur_ack, run_seqnum);
-    strcpy(send_packet->payload, message.data);
-    addToQ(send_packet);
+    if (current_state == WAITING) {
+        addToQ(message);
+    } else {
+        sendBSide(&message);
+    }
 
-    tolayer3(AEntity, getNextPacket());
-
-    run_seqnum += sizeof(struct pkt);
-    //TODO right timeout?
-    startTimer(AEntity, 100);
 }
 
 /*
@@ -115,11 +132,24 @@ void B_output(struct msg message) {
  * packet is the (possibly corrupted) packet sent from the B-side.
  */
 void A_input(struct pkt packet) {
+    if(current_state == SENDING){
+        puts("still sending packet");
+        return;
+    }
+    stopTimer(AEntity);
 //handle the ack
-//if corrupt or not 1 in acknum field, do nothing and wait for timeout
+//if corrupt or not 1 in acknum field, resend
     if (packet.acknum == 1 && compute_checksum(packet.payload, packet.acknum, packet.seqnum) == packet.checksum) {
-        base = packet.seqnum;//since the seq num of the ack is the
-        stopTimer(AEntity);
+        //we know that it sent correctly, so send the next packet.
+        free(current_packet);
+        current_state = SENDING;
+
+        run_seq = !run_seq; //since we are not using go back n, we can just swap what the sequence is
+        if(queue_head != NULL){
+            struct msg *message = popQueue();
+            sendBSide(message);
+            free(message);//have to free the memory so left as 3 instead of 1 line
+        }
     }
 //else if not corrupt and ack is 1, stop timer
 }
@@ -131,18 +161,17 @@ void A_input(struct pkt packet) {
  * and stoptimer() in the writeup for how the timer is started and stopped.
  */
 void A_timerinterrupt() {
-//    stopTimer(AEntity);
-//    struct pkt send_pkt =
-//            tolayer3(AEntity, send_pkt);
-//    //resend
-//    startTimer(AEntity,)
+    //just to layer 3 because we are simply resending the same packet, not the next packet, so no need for sendBSide
+    tolayer3(AEntity, *current_packet);
+    startTimer(AEntity, 100);
 }
 
 /* The following routine will be called once (only) before any other    */
 /* entity A routines are called. You can use it to do any initialization */
 void A_init() {
-    waiting_queue.head = NULL;
-    waiting_queue.tail = NULL;
+    queue_head = NULL;
+    queue_tail = NULL;
+    current_state = SENDING;
 }
 
 
@@ -159,13 +188,31 @@ void A_init() {
 void B_input(struct pkt packet) {
     //if packet is corrupt, do nothing and wait for timeout and handle in b_timerinterrupt,
     // else send ack packet with 1
+
     struct pkt send_packet;
+    char* empty_buffer = malloc(sizeof(char) * MESSAGE_LENGTH);
+    bzero(empty_buffer, MESSAGE_LENGTH);//make it empty, response doesnt need a payload
+
     send_packet.acknum = 1;
-    send_packet.seqnum = packet.seqnum;
-    strcpy(send_packet.payload, packet.payload);
-    send_packet.checksum = compute_checksum(packet.payload, 1, packet.seqnum);
+    send_packet.seqnum = run_seq;
+    strcpy(send_packet.payload, empty_buffer);
+    send_packet.checksum = compute_checksum(empty_buffer, 1, run_seq);
+
     tolayer3(BEntity, send_packet);
-    startTimer(BEntity, 100);
+    free(empty_buffer);//done using
+
+    //check to layer 5. the above runs no matter what, but layer 5 should only receive correct data
+    if(packet.seqnum != run_seq || compute_checksum(packet.payload, packet.acknum, packet.seqnum) != packet.checksum){
+        return;
+    }
+
+    //if we are good...
+
+    struct msg *message = malloc(sizeof(struct msg));
+    strcpy(message->data, packet.payload);
+    tolayer5(BEntity, *message);
+    run_seq = !run_seq;
+    free(message);
 }
 
 /*
@@ -175,7 +222,7 @@ void B_input(struct pkt packet) {
  * and stoptimer() in the writeup for how the timer is started and stopped.
  */
 void B_timerinterrupt() {
-    puts("hi");
+
 }
 
 /* 
@@ -183,6 +230,6 @@ void B_timerinterrupt() {
  * entity B routines are called. You can use it to do any initialization 
  */
 void B_init() {
-    puts("ectra hi");
+    //nothing
 }
 
